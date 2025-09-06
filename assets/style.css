@@ -1,0 +1,7 @@
+/* Custom style plugin Schedule Report */
+.wrap h1 {
+    font-weight: 600;
+}
+.pagination {
+    margin-top: 20px;
+}
