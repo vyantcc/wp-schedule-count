@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: WP Schedule Count
- * Description: Menampilkan jumlah artikel publish berdasarkan schedule post per hari (summary, tabel kecil Bootstrap dengan badge warna, pagination, filter kategori, dan export CSV).
- * Version: 1.5
+ * Description: Menampilkan jumlah artikel publish berdasarkan schedule post per hari (summary, tabel kecil Bootstrap dengan badge warna, pagination, filter kategori, kategori kosong, dan export CSV).
+ * Version: 1.6
  * Author: Vyant
  */
 
@@ -42,59 +42,98 @@ class WPScheduleCount {
 
     public function handle_export_csv() {
         if (!isset($_GET['page']) || $_GET['page'] !== 'wp-schedule-count') return;
-        if (!isset($_GET['export']) || $_GET['export'] !== 'csv') return;
+        if (!isset($_GET['export'])) return;
 
         global $wpdb;
 
-        $selected_cat = isset($_GET['cat']) ? intval($_GET['cat']) : 0;
-        $join_clause  = '';
-        $where_clause = "WHERE p.post_status = 'future' AND p.post_type = 'post'";
+        $export_type = sanitize_text_field($_GET['export']);
 
-        if ($selected_cat) {
-            $join_clause  = "INNER JOIN {$wpdb->term_relationships} tr ON p.ID = tr.object_id
-                             INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id";
-            $where_clause .= $wpdb->prepare(" AND tt.term_id = %d", $selected_cat);
+        // === Export utama (summary per tanggal) ===
+        if ($export_type === 'csv') {
+            $selected_cat = isset($_GET['cat']) ? intval($_GET['cat']) : 0;
+            $join_clause  = '';
+            $where_clause = "WHERE p.post_status = 'future' AND p.post_type = 'post'";
+
+            if ($selected_cat) {
+                $join_clause  = "INNER JOIN {$wpdb->term_relationships} tr ON p.ID = tr.object_id
+                                 INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id";
+                $where_clause .= $wpdb->prepare(" AND tt.term_id = %d", $selected_cat);
+            }
+
+            $results = $wpdb->get_results("
+                SELECT DATE(p.post_date) as publish_date, COUNT(p.ID) as total_posts
+                FROM {$wpdb->posts} p
+                $join_clause
+                $where_clause
+                GROUP BY DATE(p.post_date)
+                ORDER BY publish_date ASC
+            ");
+
+            $domain   = preg_replace('/^www\./', '', $_SERVER['SERVER_NAME']);
+            $date     = date('Y-m-d');
+            $filename = $domain . '-' . $date . '.csv';
+
+            header('Content-Type: text/csv; charset=utf-8');
+            header('Content-Disposition: attachment; filename="' . $filename . '"');
+
+            $output = fopen('php://output', 'w');
+            fputcsv($output, ['Tanggal Publish', 'Jumlah Artikel']);
+
+            foreach ($results as $row) {
+                fputcsv($output, [
+                    date_i18n(get_option('date_format'), strtotime($row->publish_date)),
+                    $row->total_posts
+                ]);
+            }
+            fclose($output);
+            exit;
         }
 
-        // Ambil semua data (tanpa LIMIT)
-        $results = $wpdb->get_results("
-            SELECT DATE(p.post_date) as publish_date, COUNT(p.ID) as total_posts
-            FROM {$wpdb->posts} p
-            $join_clause
-            $where_clause
-            GROUP BY DATE(p.post_date)
-            ORDER BY publish_date ASC
-        ");
+        // === Export kategori hampir habis (TXT) ===
+        if ($export_type === 'hampir_habis') {
+            $categories = get_categories(['hide_empty' => false]);
 
-        // Nama file hanya domain + tanggal
-        $domain   = preg_replace('/^www\./', '', $_SERVER['SERVER_NAME']);
-        $date     = date('Y-m-d');
-        $filename = $domain . '-' . $date . '.csv';
+            $data = [];
+            foreach ($categories as $cat) {
+                $last_date = $wpdb->get_var($wpdb->prepare("
+                    SELECT MAX(p.post_date)
+                    FROM {$wpdb->posts} p
+                    INNER JOIN {$wpdb->term_relationships} tr ON p.ID = tr.object_id
+                    INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+                    WHERE p.post_status = 'future' AND p.post_type = 'post' AND tt.term_id = %d
+                ", $cat->term_id));
 
-        // Header CSV
-        header('Content-Type: text/csv; charset=utf-8');
-        header('Content-Disposition: attachment; filename="' . $filename . '"');
+                if ($last_date) {
+                    $days_left = (int) $wpdb->get_var($wpdb->prepare("
+                        SELECT DATEDIFF(%s, NOW())
+                    ", $last_date));
 
-        $output = fopen('php://output', 'w');
-        fputcsv($output, ['Tanggal Publish', 'Jumlah Artikel']);
+                    if ($days_left < 10 && $days_left >= 0) {
+                        $data[] = $cat->name; // simpan hanya nama kategori
+                    }
+                }
+            }
 
-        foreach ($results as $row) {
-            fputcsv($output, [
-                date_i18n(get_option('date_format'), strtotime($row->publish_date)),
-                $row->total_posts
-            ]);
+            $domain   = preg_replace('/^www\./', '', $_SERVER['SERVER_NAME']);
+            $date     = date('Y-m-d');
+            $filename = $domain . '-hampir-habis-' . $date . '.txt';
+
+            header('Content-Type: text/plain; charset=utf-8');
+            header('Content-Disposition: attachment; filename="' . $filename . '"');
+
+            if (!empty($data)) {
+                echo implode("\n", $data); // tiap kategori di baris baru
+            } else {
+                echo "Tidak ada kategori dengan schedule hampir habis (< 10 hari).";
+            }
+            exit;
         }
-
-        fclose($output);
-        exit;
     }
 
     public function render_page() {
         global $wpdb;
 
-        // Ambil kategori untuk dropdown
         $categories = get_categories(['hide_empty' => false]);
-
         $selected_cat = isset($_GET['cat']) ? intval($_GET['cat']) : 0;
 
         $join_clause  = '';
@@ -120,7 +159,6 @@ class WPScheduleCount {
             $where_clause
         ");
 
-        // Pagination
         $current_page = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
         $offset       = ($current_page - 1) * $this->per_page;
 
@@ -137,7 +175,6 @@ class WPScheduleCount {
         echo '<div class="wrap container mt-4">';
         echo '<h1 class="mb-4">Schedule Post Report</h1>';
 
-        // Filter kategori + tombol export
         echo '<form method="get" class="mb-3 d-flex align-items-center">';
         echo '<input type="hidden" name="page" value="wp-schedule-count">';
         echo '<label for="cat" class="form-label me-2"><strong>Filter Kategori:</strong></label>';
@@ -152,13 +189,11 @@ class WPScheduleCount {
         echo '<a href="' . esc_url(add_query_arg(['page' => 'wp-schedule-count', 'cat' => $selected_cat, 'export' => 'csv'], admin_url('admin.php'))) . '" class="btn btn-success">Export CSV</a>';
         echo '</form>';
 
-        // Summary
         echo '<div class="alert alert-info d-flex justify-content-between align-items-center">';
         echo '<div><strong>Total Artikel Terjadwal:</strong> ' . esc_html($total_articles) . '</div>';
         echo '<div><strong>Total Hari:</strong> ' . esc_html($total_days) . '</div>';
         echo '</div>';
 
-        // Tabel
         echo '<table class="table table-sm table-bordered table-striped align-middle">';
         echo '<thead class="table-dark"><tr><th>Tanggal Publish</th><th>Jumlah Artikel</th></tr></thead>';
         echo '<tbody>';
@@ -189,7 +224,6 @@ class WPScheduleCount {
 
         echo '</tbody></table>';
 
-        // Pagination
         $total_pages = ceil($total_days / $this->per_page);
         if ($total_pages > 1) {
             $base_url = add_query_arg([
@@ -217,6 +251,65 @@ class WPScheduleCount {
                 echo '</ul></nav>';
             }
         }
+
+        // === Tambahan: kategori kosong ===
+        echo '<h2 class="mt-5">Kategori Tanpa Scheduled Post</h2>';
+        echo '<table class="table table-bordered table-striped">';
+        echo '<thead class="table-secondary"><tr><th>Kategori</th><th>Jumlah Artikel Terjadwal</th></tr></thead><tbody>';
+
+        foreach ($categories as $cat) {
+            $count_cat = (int) $wpdb->get_var($wpdb->prepare("
+                SELECT COUNT(p.ID)
+                FROM {$wpdb->posts} p
+                INNER JOIN {$wpdb->term_relationships} tr ON p.ID = tr.object_id
+                INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+                WHERE p.post_status = 'future' AND p.post_type = 'post' AND tt.term_id = %d
+            ", $cat->term_id));
+
+            if ($count_cat === 0) {
+                echo '<tr>';
+                echo '<td>' . esc_html($cat->name) . '</td>';
+                echo '<td><span class="badge bg-secondary">0</span></td>';
+                echo '</tr>';
+            }
+        }
+
+        echo '</tbody></table>';
+
+        // === Tambahan: kategori hampir habis ===
+        echo '<h2 class="mt-5">Kategori dengan Schedule Hampir Habis (&lt; 10 hari)</h2>';
+        echo '<div class="mb-3">';
+        echo '<a href="' . esc_url(add_query_arg(['page' => 'wp-schedule-count', 'export' => 'hampir_habis'], admin_url('admin.php'))) . '" class="btn btn-danger">Export TXT Hampir Habis</a>';
+        echo '</div>';
+        echo '<table class="table table-bordered table-striped">';
+        echo '<thead class="table-warning"><tr><th>Kategori</th><th>Posting Terakhir</th><th>Sisa Hari</th></tr></thead><tbody>';
+
+        foreach ($categories as $cat) {
+            $last_date = $wpdb->get_var($wpdb->prepare("
+                SELECT MAX(p.post_date)
+                FROM {$wpdb->posts} p
+                INNER JOIN {$wpdb->term_relationships} tr ON p.ID = tr.object_id
+                INNER JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+                WHERE p.post_status = 'future' AND p.post_type = 'post' AND tt.term_id = %d
+            ", $cat->term_id));
+
+            if ($last_date) {
+                $days_left = (int) $wpdb->get_var($wpdb->prepare("
+                    SELECT DATEDIFF(%s, NOW())
+                ", $last_date));
+
+                if ($days_left < 10 && $days_left >= 0) {
+                    echo '<tr>';
+                    echo '<td>' . esc_html($cat->name) . '</td>';
+                    echo '<td>' . esc_html(date_i18n(get_option('date_format'), strtotime($last_date))) . '</td>';
+                    echo '<td><span class="badge bg-danger">' . esc_html($days_left) . ' hari</span></td>';
+                    echo '</tr>';
+                }
+            }
+        }
+
+        echo '</tbody></table>';
+
 
         echo '</div>';
     }
